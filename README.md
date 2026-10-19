@@ -2,11 +2,190 @@
 
 Vue 3 客户端与轻量 Node.js WebSocket 服务端组成的多人拉密原型。
 
+## 项目架构
+
+项目由 Vue 单页客户端、Node.js 权威游戏服务和 WebRTC 房间语音组成。客户端提交操作，服务端维护房间状态并裁定结果；聊天、回放请求和语音信令复用同一条 WebSocket 连接。
+
+### 1. 运行与部署
+
+下面是 HTTPS 生产部署结构；仓库中的 Nginx 模板提供 HTTP 起点，域名与 TLS 证书需要在实际服务器上配置。
+
+```mermaid
+flowchart TB
+    browser["玩家浏览器 × 2–4<br/>Vue 单页应用"]
+    dns["DNS<br/>域名解析到服务器公网 IP"]
+    subgraph host["Linux 服务器"]
+        nginx["Nginx<br/>80：HTTP / HTTPS 跳转<br/>443：HTTPS 与 WSS"]
+        dist["dist/<br/>HTML、JS、CSS、图片"]
+        node["Node.js + ws + tsx<br/>server/index.ts · 默认端口 8787"]
+        memory["进程内存<br/>房间、手牌、牌池、回合计时器<br/>聊天、回放帧、语音成员"]
+        supervisor["systemd 或 PM2<br/>启动、重启与进程守护"]
+        nginx -->|"读取静态文件"| dist
+        nginx <-->|"/ws 反向代理到 127.0.0.1:8787"| node
+        node <--> memory
+        supervisor --> node
+    end
+    browser -.->|"解析域名"| dns
+    browser <-->|"HTTPS：页面与资源<br/>WSS /ws：游戏、聊天、语音信令"| nginx
+    other["同房间其他玩家浏览器"]
+    turn["可选 TURN 中继<br/>独立部署或第三方服务"]
+    browser <-->|"WebRTC 音频直连"| other
+    browser <-->|"必要时中继音频"| turn
+    turn <--> other
+```
+
+- Nginx 提供静态页面并代理 WebSocket；Node.js 当前不提供前端静态资源服务。
+- 公网入口通常只需开放 80/443，8787 应通过防火墙限制为服务器内部访问。当前 Node 服务没有指定监听地址，不会自动只绑定回环地址。
+- 音频不经过 Nginx 或游戏 WebSocket 服务。若使用 TURN，还需要按中继服务的配置开放其监听与媒体端口。
+- 房间状态保存在 `Map` 中，目前没有数据库、Redis、磁盘持久化或跨进程房间同步。服务端重启会清空对局、聊天与回放；当前适合运行一个游戏服务实例。
+
+### 2. 代码模块与依赖
+
+图中箭头表示“导入或使用”，存储节点表示浏览器持久化。
+
+```mermaid
+flowchart LR
+    subgraph client["浏览器客户端"]
+        main["src/main.ts<br/>挂载 Vue 应用"]
+        app["src/App.vue<br/>大厅、房间、拖拽牌桌<br/>聊天、回放、语音、设置与双语界面"]
+        socket["src/composables/useGameSocket.ts<br/>消息收发、房间恢复、自动重连<br/>WebRTC 连接与麦克风生命周期"]
+        storage["localStorage / sessionStorage<br/>偏好设置、重连令牌与会话恢复"]
+        media["浏览器媒体 API<br/>getUserMedia / RTCPeerConnection<br/>Audio 播放"]
+        main --> app
+        app --> socket
+        app --> storage
+        socket --> storage
+        socket --> media
+    end
+    protocol["shared/protocol.ts<br/>牌型与棋盘常量、房间快照<br/>客户端 / 服务端消息、回放与语音类型"]
+    validator["server/validator.ts<br/>顺子、同数组合与特殊 Joker 校验<br/>纯规则函数，前后端共同使用"]
+    scoring["server/scoring.ts<br/>本回合新增牌计分<br/>支持首次出牌 30 分要求"]
+    server["server/index.ts<br/>房间与玩家、回合状态机、计时器<br/>牌库存核验、聊天、回放、语音信令"]
+    app --> protocol
+    socket --> protocol
+    app -->|"即时合法性提示"| validator
+    server --> protocol
+    validator --> protocol
+    scoring --> protocol
+    server -->|"最终合法性裁定"| validator
+    server --> scoring
+    scoring --> validator
+    socket <-->|"WebSocket JSON 消息"| server
+```
+
+| 路径 | 职责 |
+| --- | --- |
+| [`src/App.vue`](src/App.vue) | 主要交互、牌桌动画、设置、结算和回放界面 |
+| [`src/composables/useGameSocket.ts`](src/composables/useGameSocket.ts) | 游戏网络状态、断线恢复及语音连接 |
+| [`shared/protocol.ts`](shared/protocol.ts) | 前后端共同使用的消息类型和数据结构；不是独立运行的服务 |
+| [`server/index.ts`](server/index.ts) | 单进程权威游戏服务与 WebSocket 消息分发 |
+| [`server/validator.ts`](server/validator.ts)、[`server/scoring.ts`](server/scoring.ts) | 规则校验与计分 |
+| [`public/`](public/)、[`src/assets/`](src/assets/) | 背景、图标及图片资源 |
+| [`deploy/`](deploy/)、[`ecosystem.config.cjs`](ecosystem.config.cjs) | Nginx、systemd 与 PM2 部署模板 |
+| [`server/validator-test.ts`](server/validator-test.ts)、[`server/smoke-test.ts`](server/smoke-test.ts) | 规则测试与游戏 / 语音信令集成测试 |
+
+### 3. 游戏操作与状态同步
+
+房间按 `WAITING → PLAYING → FINISHED` 流转，房主可以在结束后请求回到等待状态再开一局。服务端使用 `revision` 拒绝基于过期状态的修改，并为每位玩家分别生成快照：对局中发送该玩家的完整手牌，其他玩家只公开手牌数量。
+
+```mermaid
+sequenceDiagram
+    participant A as 当前玩家
+    participant S as useGameSocket
+    participant G as 游戏服务
+    participant R as 校验与计分
+    participant B as 其他玩家
+    A->>S: 拖拽牌、移动组合或收回本回合新牌
+    S->>G: board:update（revision、cells、hand）
+    G->>G: 检查身份、回合、版本、牌库存和旧牌保留
+    alt 请求过期或数据不合法
+        G-->>S: error + 当前玩家的最新 room:state
+    else 接受摆放
+        G->>G: 保存桌面，revision + 1，记录变化的回放帧
+        G-->>S: room:state（本人手牌 + 公共状态）
+        G-->>B: room:state（各自手牌 + 公共状态）
+        A->>S: 提交本回合
+        S->>G: turn:commit（revision）
+        G->>R: 校验最终组合、计算新牌分值
+        R-->>G: 合法性与计分结果
+        alt 组合不合法或首次出牌不足 30 分
+            G-->>S: 保留摆放，返回错误和标记状态
+            G-->>B: 更新公共状态
+        else 提交成功
+            G->>G: 轮到下一位，或手牌清空后结束对局
+            G-->>S: room:state
+            G-->>B: room:state
+        end
+    end
+```
+
+摆牌阶段先核对数据和牌库存，完整组合是否合法在提交时统一裁定；前端提示用于辅助操作。服务端同时处理摸牌、撤回、回合超时及胜负判定。断线后保留席位 60 秒，客户端凭 `roomId + reconnectToken` 恢复连接；完整回放仅在对局结束后通过 `replay:request` 获取，包含各玩家当时的手牌。
+
+### 4. 语音信令与音频传输
+
+语音使用房间内的多方点对点连接：每位加入语音的玩家分别连接其他语音成员。四人全员加入时最多形成六条双向连接，目前没有集中混音或 SFU 媒体服务。
+
+```mermaid
+sequenceDiagram
+    participant A as 新加入语音的玩家 A
+    participant G as 游戏 WebSocket 服务
+    participant B as 已加入语音的玩家 B
+    participant I as STUN / 可选 TURN
+    A->>A: 用户点击加入，授权麦克风
+    A->>G: voice:join
+    G-->>A: voice:peers（已有语音成员）
+    G-->>B: voice:peer-joined
+    A->>G: voice:signal（offer）
+    G->>B: 转发 offer
+    B->>G: voice:signal（answer）
+    G->>A: 转发 answer
+    A->>I: 收集 ICE 候选地址
+    B->>I: 收集 ICE 候选地址
+    A->>G: voice:signal（ICE 候选）
+    G->>B: 转发 A 的候选地址
+    B->>G: voice:signal（ICE 候选）
+    G->>A: 转发 B 的候选地址
+    Note over A,I: ICE 候选收集与 SDP 协商可交错进行
+    alt 直连成功
+        A<<->>B: WebRTC 双向音频
+    else 直连不可用且已配置可用 TURN
+        A<<->>I: 加密音频经 TURN 中继
+        I<<->>B: 加密音频经 TURN 中继
+    end
+    A->>A: 静音时关闭本地音轨输出
+    A->>G: voice:mute
+    G-->>B: voice:peer-muted
+```
+
+公网麦克风访问需要 HTTPS，信令随页面使用 WSS。默认 STUN 地址为 `stun:stun.l.google.com:19302`；它用于发现连接候选地址，不负责转发音频。严格 NAT 或受限网络可能需要 TURN。语音成员列表显示已加入，不代表媒体连接一定成功；真实通话仍需两台设备在不同网络下验证。
+
+### 5. 构建与更新
+
+```mermaid
+flowchart LR
+    source["Git 仓库<br/>src / public / server / shared<br/>package.json / 锁文件 / 配置"]
+    install["npm ci --include=dev"]
+    build["npm run build<br/>vue-tsc 类型检查 + Vite 打包"]
+    dist["dist/<br/>可直接部署的前端产物"]
+    files["server/ + shared/<br/>服务端直接运行 TypeScript"]
+    nginx["上传 dist，Nginx 读取新版"]
+    runtime["Node.js --import tsx<br/>由 systemd 或 PM2 守护"]
+    source --> install
+    install --> build
+    build --> dist
+    source --> files
+    dist --> nginx
+    files --> runtime
+    install -->|"服务端也需要 tsx 依赖"| runtime
+```
+
+前端产物不提交 Git。服务端目前没有单独编译为 JavaScript 的构建步骤，`check:server` 只进行类型检查。修改共享协议时应一起更新前端产物、`server/` 与 `shared/`，避免不同版本的消息结构混用。
+
 ## 当前流程
 
 - 简洁的在线大厅，可创建或凭 6 位代码加入 2–4 人房间
 - 等待房间、玩家席位、房间号复制、完整对局与胜利排名页面
-- 设置浮窗支持昵称、动效、高对比牌面、背景纹理及冰蓝、星紫、竞技街机三套主题，并保存在本地；竞技主题采用普通微圆角矩形、四面等厚的哑光亚克力边面与实体按压反馈
+- 设置浮窗支持昵称、动效、音效、高对比牌面、背景纹理及冰蓝、竞技街机两套主题，并保存在本地；竞技主题采用普通微圆角矩形、四面等厚的哑光亚克力边面与实体按压反馈
 - 顶栏可即时切换中文与英文，设置会本地保存；大厅、房间、牌桌、聊天、玩法和开发者工具均提供双语文案与对应尺寸适配
 - 牌桌使用独立的凸起画框包裹内凹网格，网格扩缩时画框会同步平滑调整尺寸
 - 刷新页面自动恢复房间；意外断线后自动重试，服务端保留玩家席位 60 秒
@@ -81,6 +260,16 @@ npm run build
 ## 语音部署
 
 本地 `localhost` 可以直接申请麦克风权限。上传到公网时，页面必须使用 HTTPS，WebSocket 也应通过 WSS 连接。
+
+| 变量 | 生效阶段 | 用途 |
+| --- | --- | --- |
+| `WS_PORT` | Node.js 服务启动时 | WebSocket 监听端口，默认 `8787` |
+| `VITE_WS_URL` | 前端构建时 | 覆盖 WebSocket 地址；不设置时，开发环境连接页面主机的 `8787`，生产环境连接同源 `/ws`，并随 HTTPS 自动使用 WSS |
+| `VITE_TURN_URL` | 前端构建时 | 可选 TURN 中继地址 |
+| `VITE_TURN_USERNAME` | 前端构建时 | TURN 用户名 |
+| `VITE_TURN_CREDENTIAL` | 前端构建时 | TURN 访问凭据 |
+
+`VITE_*` 配置会写进浏览器收到的构建文件；修改后必须重新构建并上传 `dist/`，只重启 systemd 不会更新这些值。TURN 凭据在客户端可见，不能作为服务端私密凭据保存。
 
 语音默认使用 STUN 建立玩家间直连。为了让严格 NAT、校园网或部分移动网络下的玩家也能稳定加入，生产环境建议配置 TURN 中继：
 
