@@ -1,0 +1,22 @@
+# systemd 服务（不用 PM2 的替代方案）
+# 用法：
+#   1) 把这个文件放到 /etc/systemd/system/rummikub.service
+#   2) 确认 node 路径：`which node`，把下面 ExecStart 里的路径改对
+#   3) sudo systemctl daemon-reload
+#   4) sudo systemctl enable --now rummikub
+[Unit]
+Description=Rummikub WebSocket Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/rummikub   # ← 改成本机部署目录
+# 若 node 不在 /usr/bin，用 `which node` 查到的绝对路径替换
+ExecStart=/usr/bin/node --import tsx server/index.ts
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=WS_PORT=8787
+
+[Install]
+WantedBy=multi-user.target
