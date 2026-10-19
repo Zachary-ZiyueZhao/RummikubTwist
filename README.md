@@ -1,5 +1,7 @@
 # RummikubTwist
 
+[中文](README.md) | [English](README.en.md)
+
 Vue 3 客户端与轻量 Node.js WebSocket 服务端组成的多人拉密原型。
 
 ## 项目架构
